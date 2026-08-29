@@ -496,7 +496,7 @@ The backend exposes REST endpoints for interacting with the runtime environment.
 The core submission workflow includes:
 
 ```http
-POST /api/submissions
+POST /submissions
 ```
 
 A submission contains the source code and test cases required for execution.
