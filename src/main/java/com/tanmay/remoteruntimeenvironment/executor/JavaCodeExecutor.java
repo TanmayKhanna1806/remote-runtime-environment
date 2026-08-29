@@ -1,10 +1,13 @@
 package com.tanmay.remoteruntimeenvironment.executor;
 
+import com.tanmay.remoteruntimeenvironment.model.TestCase;
+
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 public class JavaCodeExecutor {
@@ -14,17 +17,24 @@ public class JavaCodeExecutor {
     private static final long MAX_OUTPUT_BYTES = 1024 * 1024; // 1 MB
     private static final long MAX_MEMORY_MB = 256;
 
-    public ExecutionResult execute(String sourceCode, String expectedOutput) {
+    public ExecutionResult execute(
+            String sourceCode,
+            List<TestCase> testCases) {
 
         Path workingDirectory = null;
 
         try {
             workingDirectory = Files.createTempDirectory("submission-");
 
-            Path sourceFile = workingDirectory.resolve("Solution.java");
+            Path sourceFile =
+                    workingDirectory.resolve("Solution.java");
+
             Files.writeString(sourceFile, sourceCode);
 
-            // Compile
+            // -------------------------
+            // COMPILATION
+            // -------------------------
+
             Process compileProcess = new ProcessBuilder(
                     "javac",
                     "Solution.java"
@@ -39,6 +49,7 @@ public class JavaCodeExecutor {
             );
 
             if (!compilationFinished) {
+
                 compileProcess.destroyForcibly();
 
                 return new ExecutionResult(
@@ -50,9 +61,14 @@ public class JavaCodeExecutor {
             }
 
             String compilerOutput =
-                    new String(compileProcess.getInputStream().readAllBytes());
+                    new String(
+                            compileProcess
+                                    .getInputStream()
+                                    .readAllBytes()
+                    );
 
             if (compileProcess.exitValue() != 0) {
+
                 return new ExecutionResult(
                         ExecutionResult.Verdict.COMPILE_ERROR,
                         "",
@@ -61,101 +77,137 @@ public class JavaCodeExecutor {
                 );
             }
 
-            // Execute
-            long startTime = System.currentTimeMillis();
+            // -------------------------
+            // TEST CASE EXECUTION
+            // -------------------------
 
-            Process executionProcess = new ProcessBuilder(
-                    "java",
-                    "-Xmx" + MAX_MEMORY_MB + "m",
-                    "Solution"
-            )
-                    .directory(workingDirectory.toFile())
-                    .redirectErrorStream(true)
-                    .start();
+            long totalExecutionTime = 0;
 
-            ByteArrayOutputStream outputBuffer =
-                    new ByteArrayOutputStream();
+            for (int i = 0; i < testCases.size(); i++) {
 
-            Thread outputReader = new Thread(() ->
-                    readOutput(
-                            executionProcess,
-                            outputBuffer
-                    )
-            );
+                TestCase testCase = testCases.get(i);
 
-            outputReader.start();
+                long startTime = System.currentTimeMillis();
 
-            boolean executionFinished = executionProcess.waitFor(
-                    EXECUTION_TIMEOUT_SECONDS,
-                    TimeUnit.SECONDS
-            );
+                Process executionProcess = new ProcessBuilder(
+                        "java",
+                        "-Xmx" + MAX_MEMORY_MB + "m",
+                        "Solution"
+                )
+                        .directory(workingDirectory.toFile())
+                        .redirectErrorStream(true)
+                        .start();
 
-            long executionTime =
-                    System.currentTimeMillis() - startTime;
+                // Send test case input to program
+                if (testCase.getInput() != null) {
 
-            // Check whether output limit was exceeded
-            if (outputBuffer.size() > MAX_OUTPUT_BYTES) {
+                    executionProcess
+                            .getOutputStream()
+                            .write(testCase.getInput().getBytes());
 
-                executionProcess.destroyForcibly();
+                }
+
+                executionProcess.getOutputStream().close();
+
+                ByteArrayOutputStream outputBuffer =
+                        new ByteArrayOutputStream();
+
+                Thread outputReader = new Thread(() ->
+                        readOutput(
+                                executionProcess,
+                                outputBuffer
+                        )
+                );
+
+                outputReader.start();
+
+                boolean executionFinished =
+                        executionProcess.waitFor(
+                                EXECUTION_TIMEOUT_SECONDS,
+                                TimeUnit.SECONDS
+                        );
+
+                long executionTime =
+                        System.currentTimeMillis() - startTime;
+
+                totalExecutionTime += executionTime;
+
+                // Output limit
+                if (outputBuffer.size() > MAX_OUTPUT_BYTES) {
+
+                    executionProcess.destroyForcibly();
+                    outputReader.join(1000);
+
+                    return new ExecutionResult(
+                            ExecutionResult.Verdict.SYSTEM_ERROR,
+                            outputBuffer.toString(),
+                            "Output exceeded the 1 MB limit on test case "
+                                    + (i + 1),
+                            totalExecutionTime
+                    );
+                }
+
+                // Time limit
+                if (!executionFinished) {
+
+                    executionProcess.destroyForcibly();
+                    outputReader.join(1000);
+
+                    return new ExecutionResult(
+                            ExecutionResult.Verdict.TIME_LIMIT_EXCEEDED,
+                            outputBuffer.toString(),
+                            "Execution exceeded the time limit on test case "
+                                    + (i + 1),
+                            totalExecutionTime
+                    );
+                }
+
                 outputReader.join(1000);
 
-                return new ExecutionResult(
-                        ExecutionResult.Verdict.SYSTEM_ERROR,
-                        outputBuffer.toString(),
-                        "Output exceeded the 1 MB limit.",
-                        executionTime
-                );
+                String output = outputBuffer.toString();
+
+                // Runtime error
+                if (executionProcess.exitValue() != 0) {
+
+                    return new ExecutionResult(
+                            ExecutionResult.Verdict.RUNTIME_ERROR,
+                            output,
+                            "Runtime error on test case "
+                                    + (i + 1)
+                                    + ". Exit code: "
+                                    + executionProcess.exitValue(),
+                            totalExecutionTime
+                    );
+                }
+
+                // Compare output
+                String actual =
+                        normalizeOutput(output);
+
+                String expected =
+                        normalizeOutput(
+                                testCase.getExpectedOutput()
+                        );
+
+                if (!actual.equals(expected)) {
+
+                    return new ExecutionResult(
+                            ExecutionResult.Verdict.WRONG_ANSWER,
+                            output,
+                            "Wrong answer on test case "
+                                    + (i + 1),
+                            totalExecutionTime
+                    );
+                }
             }
 
-            // Time limit
-            if (!executionFinished) {
-
-                executionProcess.destroyForcibly();
-                outputReader.join(1000);
-
-                return new ExecutionResult(
-                        ExecutionResult.Verdict.TIME_LIMIT_EXCEEDED,
-                        outputBuffer.toString(),
-                        "Execution exceeded the time limit.",
-                        executionTime
-                );
-            }
-
-            outputReader.join(1000);
-
-            String output = outputBuffer.toString();
-
-            // Runtime error
-            if (executionProcess.exitValue() != 0) {
-
-                return new ExecutionResult(
-                        ExecutionResult.Verdict.RUNTIME_ERROR,
-                        output,
-                        "Program exited with code "
-                                + executionProcess.exitValue(),
-                        executionTime
-                );
-            }
-
-            // Output comparison
-            String actual = normalizeOutput(output);
-            String expected = normalizeOutput(expectedOutput);
-
-            if (actual.equals(expected)) {
-
-                return new ExecutionResult(
-                        ExecutionResult.Verdict.ACCEPTED,
-                        output,
-                        "",
-                        executionTime
-                );
-            }
-
+            // All test cases passed
             return new ExecutionResult(
-                    ExecutionResult.Verdict.WRONG_ANSWER,
-                    output,
-                    "Output does not match expected output.",
-                    executionTime
+                    ExecutionResult.Verdict.ACCEPTED,
+                    "All " + testCases.size()
+                            + " test cases passed.",
+                    "",
+                    totalExecutionTime
             );
 
         } catch (IOException e) {
@@ -188,20 +240,27 @@ public class JavaCodeExecutor {
 
     private void readOutput(
             Process process,
-            ByteArrayOutputStream outputBuffer
-    ) {
+            ByteArrayOutputStream outputBuffer) {
 
-        try (InputStream inputStream = process.getInputStream()) {
+        try (InputStream inputStream =
+                     process.getInputStream()) {
 
             byte[] buffer = new byte[8192];
 
             int bytesRead;
 
-            while ((bytesRead = inputStream.read(buffer)) != -1) {
+            while ((bytesRead =
+                    inputStream.read(buffer)) != -1) {
 
-                outputBuffer.write(buffer, 0, bytesRead);
+                outputBuffer.write(
+                        buffer,
+                        0,
+                        bytesRead
+                );
 
-                if (outputBuffer.size() > MAX_OUTPUT_BYTES) {
+                if (outputBuffer.size()
+                        > MAX_OUTPUT_BYTES) {
+
                     process.destroyForcibly();
                     break;
                 }
@@ -229,10 +288,12 @@ public class JavaCodeExecutor {
             Files.walk(directory)
                     .sorted((a, b) -> b.compareTo(a))
                     .forEach(path -> {
+
                         try {
                             Files.deleteIfExists(path);
                         } catch (IOException ignored) {
                         }
+
                     });
 
         } catch (IOException ignored) {
