@@ -1,5 +1,6 @@
 package com.tanmay.remoteruntimeenvironment.controller;
 
+import com.tanmay.remoteruntimeenvironment.dto.SubmissionResponse;
 import com.tanmay.remoteruntimeenvironment.model.Submission;
 import com.tanmay.remoteruntimeenvironment.model.TestCase;
 import com.tanmay.remoteruntimeenvironment.service.SubmissionService;
@@ -21,7 +22,7 @@ public class SubmissionController {
     }
 
     @PostMapping
-    public ResponseEntity<Submission> submit(
+    public ResponseEntity<SubmissionResponse> submit(
             @RequestBody SubmissionRequest request) {
 
         Submission submission =
@@ -30,11 +31,13 @@ public class SubmissionController {
                         request.testCases()
                 );
 
-        return ResponseEntity.accepted().body(submission);
+        return ResponseEntity.accepted().body(
+                toResponse(submission)
+        );
     }
 
     @GetMapping("/{id}")
-    public ResponseEntity<Submission> getSubmission(
+    public ResponseEntity<SubmissionResponse> getSubmission(
             @PathVariable Long id) {
 
         Submission submission =
@@ -44,7 +47,21 @@ public class SubmissionController {
             return ResponseEntity.notFound().build();
         }
 
-        return ResponseEntity.ok(submission);
+        return ResponseEntity.ok(
+                toResponse(submission)
+        );
+    }
+
+    private SubmissionResponse toResponse(
+            Submission submission) {
+
+        return new SubmissionResponse(
+                submission.getId(),
+                submission.getVerdict(),
+                submission.getOutput(),
+                submission.getError(),
+                submission.getExecutionTimeMs()
+        );
     }
 
     public record SubmissionRequest(
