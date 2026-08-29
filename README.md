@@ -209,7 +209,8 @@ The system is designed to handle common abnormal execution scenarios.
 
 A submission such as:
 
-```java
+```
+java
 while (true) {
 }
 ```
