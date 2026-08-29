@@ -12,6 +12,7 @@ public class JavaCodeExecutor {
     private static final long COMPILATION_TIMEOUT_SECONDS = 10;
     private static final long EXECUTION_TIMEOUT_SECONDS = 5;
     private static final long MAX_OUTPUT_BYTES = 1024 * 1024; // 1 MB
+    private static final long MAX_MEMORY_MB = 256;
 
     public ExecutionResult execute(String sourceCode, String expectedOutput) {
 
@@ -65,6 +66,7 @@ public class JavaCodeExecutor {
 
             Process executionProcess = new ProcessBuilder(
                     "java",
+                    "-Xmx" + MAX_MEMORY_MB + "m",
                     "Solution"
             )
                     .directory(workingDirectory.toFile())
