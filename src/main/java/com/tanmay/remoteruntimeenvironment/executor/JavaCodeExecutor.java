@@ -7,15 +7,19 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 public class JavaCodeExecutor {
 
-    private static final long COMPILATION_TIMEOUT_SECONDS = 10;
     private static final long EXECUTION_TIMEOUT_SECONDS = 5;
-    private static final long MAX_OUTPUT_BYTES = 1024 * 1024; // 1 MB
+    private static final long COMPILATION_TIMEOUT_SECONDS = 10;
+    private static final long MAX_OUTPUT_BYTES = 1024 * 1024;
     private static final long MAX_MEMORY_MB = 256;
+
+    private static final String DOCKER_IMAGE =
+            "remote-runtime-java:17";
 
     public ExecutionResult execute(
             String sourceCode,
@@ -24,29 +28,49 @@ public class JavaCodeExecutor {
         Path workingDirectory = null;
 
         try {
-            workingDirectory = Files.createTempDirectory("submission-");
+            workingDirectory =
+                    Files.createTempDirectory("submission-");
 
             Path sourceFile =
                     workingDirectory.resolve("Solution.java");
 
             Files.writeString(sourceFile, sourceCode);
 
-            // -------------------------
-            // COMPILATION
-            // -------------------------
-
+            // Compile once inside Docker.
             Process compileProcess = new ProcessBuilder(
-                    "javac",
-                    "Solution.java"
+                    "docker", "run", "--rm",
+                    "--network", "none",
+                    "--memory", MAX_MEMORY_MB + "m",
+                    "--cpus", "1",
+                    "--pids-limit", "64",
+                    "--read-only",
+                    "--tmpfs",
+                    "/sandbox:rw,nosuid,size=64m,uid=1001,gid=1001",
+                    "--mount",
+                    "type=bind,source="
+                            + sourceFile.toAbsolutePath()
+                            + ",target=/input/Solution.java,readonly",
+                    DOCKER_IMAGE,
+                    "sh", "-c",
+                    "cp /input/Solution.java /sandbox/Solution.java && "
+                            + "javac /sandbox/Solution.java"
             )
-                    .directory(workingDirectory.toFile())
                     .redirectErrorStream(true)
                     .start();
 
-            boolean compilationFinished = compileProcess.waitFor(
-                    COMPILATION_TIMEOUT_SECONDS,
-                    TimeUnit.SECONDS
-            );
+            boolean compilationFinished =
+                    compileProcess.waitFor(
+                            COMPILATION_TIMEOUT_SECONDS,
+                            TimeUnit.SECONDS
+                    );
+
+            String compilerOutput =
+                    new String(
+                            compileProcess
+                                    .getInputStream()
+                                    .readAllBytes(),
+                            StandardCharsets.UTF_8
+                    );
 
             if (!compilationFinished) {
 
@@ -60,13 +84,6 @@ public class JavaCodeExecutor {
                 );
             }
 
-            String compilerOutput =
-                    new String(
-                            compileProcess
-                                    .getInputStream()
-                                    .readAllBytes()
-                    );
-
             if (compileProcess.exitValue() != 0) {
 
                 return new ExecutionResult(
@@ -77,65 +94,97 @@ public class JavaCodeExecutor {
                 );
             }
 
-            // -------------------------
-            // TEST CASE EXECUTION
-            // -------------------------
-
+            /*
+             * The compilation container is removed after it exits,
+             * so the compiled class must be produced again for execution.
+             *
+             * Each test case therefore gets its own isolated container.
+             */
             long totalExecutionTime = 0;
 
             for (int i = 0; i < testCases.size(); i++) {
 
                 TestCase testCase = testCases.get(i);
 
-                long startTime = System.currentTimeMillis();
+                long startTime =
+                        System.currentTimeMillis();
 
-                Process executionProcess = new ProcessBuilder(
-                        "java",
-                        "-Xmx" + MAX_MEMORY_MB + "m",
-                        "Solution"
+                /*
+                 * Create a temporary input file on the host.
+                 * This avoids stdin being consumed by the shell
+                 * before it reaches the Java program.
+                 */
+                Path inputFile =
+                        workingDirectory.resolve(
+                                "input-" + i + ".txt"
+                        );
+
+                Files.writeString(
+                        inputFile,
+                        testCase.getInput() == null
+                                ? ""
+                                : testCase.getInput()
+                );
+
+                Process process = new ProcessBuilder(
+                        "docker", "run", "--rm",
+                        "--network", "none",
+                        "--memory", MAX_MEMORY_MB + "m",
+                        "--cpus", "1",
+                        "--pids-limit", "64",
+                        "--read-only",
+                        "--tmpfs",
+                        "/sandbox:rw,nosuid,size=64m,uid=1001,gid=1001",
+                        "--mount",
+                        "type=bind,source="
+                                + sourceFile.toAbsolutePath()
+                                + ",target=/input/Solution.java,readonly",
+                        "--mount",
+                        "type=bind,source="
+                                + inputFile.toAbsolutePath()
+                                + ",target=/input/test.txt,readonly",
+                        DOCKER_IMAGE,
+                        "sh", "-c",
+                        "cp /input/Solution.java /sandbox/Solution.java && "
+                                + "javac /sandbox/Solution.java && "
+                                + "java -Xmx"
+                                + MAX_MEMORY_MB
+                                + "m -cp /sandbox Solution "
+                                + "< /input/test.txt"
                 )
-                        .directory(workingDirectory.toFile())
                         .redirectErrorStream(true)
                         .start();
-
-                // Send test case input to program
-                if (testCase.getInput() != null) {
-
-                    executionProcess
-                            .getOutputStream()
-                            .write(testCase.getInput().getBytes());
-
-                }
-
-                executionProcess.getOutputStream().close();
 
                 ByteArrayOutputStream outputBuffer =
                         new ByteArrayOutputStream();
 
-                Thread outputReader = new Thread(() ->
-                        readOutput(
-                                executionProcess,
-                                outputBuffer
-                        )
-                );
+                Thread outputReader =
+                        new Thread(() ->
+                                readOutput(
+                                        process,
+                                        outputBuffer
+                                )
+                        );
 
                 outputReader.start();
 
-                boolean executionFinished =
-                        executionProcess.waitFor(
+                boolean finished =
+                        process.waitFor(
                                 EXECUTION_TIMEOUT_SECONDS,
                                 TimeUnit.SECONDS
                         );
 
                 long executionTime =
-                        System.currentTimeMillis() - startTime;
+                        System.currentTimeMillis()
+                                - startTime;
 
                 totalExecutionTime += executionTime;
 
-                // Output limit
-                if (outputBuffer.size() > MAX_OUTPUT_BYTES) {
+                if (outputBuffer.size()
+                        > MAX_OUTPUT_BYTES) {
 
-                    executionProcess.destroyForcibly();
+                    process.destroyForcibly();
+
                     outputReader.join(1000);
 
                     return new ExecutionResult(
@@ -147,10 +196,10 @@ public class JavaCodeExecutor {
                     );
                 }
 
-                // Time limit
-                if (!executionFinished) {
+                if (!finished) {
 
-                    executionProcess.destroyForcibly();
+                    process.destroyForcibly();
+
                     outputReader.join(1000);
 
                     return new ExecutionResult(
@@ -164,10 +213,10 @@ public class JavaCodeExecutor {
 
                 outputReader.join(1000);
 
-                String output = outputBuffer.toString();
+                String output =
+                        outputBuffer.toString();
 
-                // Runtime error
-                if (executionProcess.exitValue() != 0) {
+                if (process.exitValue() != 0) {
 
                     return new ExecutionResult(
                             ExecutionResult.Verdict.RUNTIME_ERROR,
@@ -175,12 +224,11 @@ public class JavaCodeExecutor {
                             "Runtime error on test case "
                                     + (i + 1)
                                     + ". Exit code: "
-                                    + executionProcess.exitValue(),
+                                    + process.exitValue(),
                             totalExecutionTime
                     );
                 }
 
-                // Compare output
                 String actual =
                         normalizeOutput(output);
 
@@ -201,7 +249,6 @@ public class JavaCodeExecutor {
                 }
             }
 
-            // All test cases passed
             return new ExecutionResult(
                     ExecutionResult.Verdict.ACCEPTED,
                     "All " + testCases.size()
